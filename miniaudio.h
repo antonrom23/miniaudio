@@ -8022,6 +8022,7 @@ struct ma_device
             ma_aaudio_input_preset inputPreset;
             ma_aaudio_allowed_capture_policy allowedCapturePolicy;
             ma_bool32 noAutoStartAfterReroute;
+            int32_t captureSessionId; /* sdk-patch: AAudio session ID for AcousticEchoCanceler.create(). Valid IDs are > 0. */
         } aaudio;
 #endif
 #ifdef MA_SUPPORT_OPENSL
@@ -36659,6 +36660,8 @@ static ma_result ma_context_init__coreaudio(ma_context* pContext, const ma_conte
         desc.componentType         = kAudioUnitType_Output;
     #if defined(MA_APPLE_DESKTOP)
         desc.componentSubType      = kAudioUnitSubType_HALOutput;
+    #elif defined(SDK_IOS_VPIO)
+        desc.componentSubType      = kAudioUnitSubType_VoiceProcessingIO; /* sdk-patch: VPIO for AEC on iOS. */
     #else
         desc.componentSubType      = kAudioUnitSubType_RemoteIO;
     #endif
@@ -39224,6 +39227,7 @@ typedef int32_t                  (* MA_PFN_AAudioStream_getFramesPerDataCallback
 typedef int32_t                  (* MA_PFN_AAudioStream_getFramesPerBurst)               (ma_AAudioStream* pStream);
 typedef ma_aaudio_result_t       (* MA_PFN_AAudioStream_requestStart)                    (ma_AAudioStream* pStream);
 typedef ma_aaudio_result_t       (* MA_PFN_AAudioStream_requestStop)                     (ma_AAudioStream* pStream);
+typedef int32_t                  (* MA_PFN_AAudioStream_getSessionId)                    (ma_AAudioStream* pStream); /* sdk-patch */
 
 static ma_result ma_result_from_aaudio(ma_aaudio_result_t resultAA)
 {
@@ -39432,6 +39436,11 @@ static ma_result ma_create_and_configure_AAudioStreamBuilder__aaudio(ma_context*
                 ((MA_PFN_AAudioStreamBuilder_setInputPreset)pContext->aaudio.AAudioStreamBuilder_setInputPreset)(pBuilder, ma_to_input_preset__aaudio(pConfig->aaudio.inputPreset));
             }
 
+            /* sdk-patch: force VOICE_COMMUNICATION usage on capture to activate HW AEC. */
+            if (pContext->aaudio.AAudioStreamBuilder_setUsage != NULL) {
+                ((MA_PFN_AAudioStreamBuilder_setUsage)pContext->aaudio.AAudioStreamBuilder_setUsage)(pBuilder, MA_AAUDIO_USAGE_VOICE_COMMUNICATION);
+            }
+
             ((MA_PFN_AAudioStreamBuilder_setDataCallback)pContext->aaudio.AAudioStreamBuilder_setDataCallback)(pBuilder, ma_stream_data_callback_capture__aaudio, (void*)pDevice);
         } else {
             if (pConfig->aaudio.usage != ma_aaudio_usage_default && pContext->aaudio.AAudioStreamBuilder_setUsage != NULL) {
@@ -39449,12 +39458,8 @@ static ma_result ma_create_and_configure_AAudioStreamBuilder__aaudio(ma_context*
             ((MA_PFN_AAudioStreamBuilder_setDataCallback)pContext->aaudio.AAudioStreamBuilder_setDataCallback)(pBuilder, ma_stream_data_callback_playback__aaudio, (void*)pDevice);
         }
 
-        /*
-        If we set AAUDIO_PERFORMANCE_MODE_LOW_LATENCY, we allow for MMAP (non-legacy path).
-        Since there's a mapping between miniaudio's performance profiles and AAudio's performance modes, let's use it.
-        Beware though, with a conservative performance profile, AAudio will indeed take the legacy path.
-        */
-        ((MA_PFN_AAudioStreamBuilder_setPerformanceMode)pContext->aaudio.AAudioStreamBuilder_setPerformanceMode)(pBuilder, (pConfig->performanceProfile == ma_performance_profile_low_latency) ? MA_AAUDIO_PERFORMANCE_MODE_LOW_LATENCY : MA_AAUDIO_PERFORMANCE_MODE_NONE);
+        /* sdk-patch: always use LOW_LATENCY for MMAP (non-legacy) path and minimal round-trip delay. */
+        ((MA_PFN_AAudioStreamBuilder_setPerformanceMode)pContext->aaudio.AAudioStreamBuilder_setPerformanceMode)(pBuilder, MA_AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
 
         /* We need to set an error callback to detect device changes. */
         if (pDevice != NULL) {  /* <-- pDevice should never be null if pDescriptor is not null, which is always the case if we hit this branch. Check anyway for safety. */
@@ -39729,6 +39734,14 @@ static ma_result ma_device_init_by_type__aaudio(ma_device* pDevice, const ma_dev
     }
 
     *ppStream = pStream;
+
+    /* sdk-patch: read session ID from capture stream for AcousticEchoCanceler.create(). */
+    if (deviceType == ma_device_type_capture) {
+        MA_PFN_AAudioStream_getSessionId pfnGetSessionId = (MA_PFN_AAudioStream_getSessionId)ma_dlsym(ma_context_get_log(pDevice->pContext), pDevice->pContext->aaudio.hAAudio, "AAudioStream_getSessionId");
+        if (pfnGetSessionId != NULL) {
+            pDevice->aaudio.captureSessionId = pfnGetSessionId(pStream);
+        }
+    }
 
     return MA_SUCCESS;
 }
