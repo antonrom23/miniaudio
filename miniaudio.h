@@ -39458,8 +39458,18 @@ static ma_result ma_create_and_configure_AAudioStreamBuilder__aaudio(ma_context*
             ((MA_PFN_AAudioStreamBuilder_setDataCallback)pContext->aaudio.AAudioStreamBuilder_setDataCallback)(pBuilder, ma_stream_data_callback_playback__aaudio, (void*)pDevice);
         }
 
-        /* sdk-patch: always use LOW_LATENCY for MMAP (non-legacy) path and minimal round-trip delay. */
-        ((MA_PFN_AAudioStreamBuilder_setPerformanceMode)pContext->aaudio.AAudioStreamBuilder_setPerformanceMode)(pBuilder, MA_AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+        /* sdk-patch: NONE for voice_communication routes (LOW_LATENCY's MMAP path is incompatible with BT SCO/HFP), LOW_LATENCY otherwise. See Oboe issues #155, #978, #1842. */
+        {
+            ma_aaudio_performance_mode_t perfMode = MA_AAUDIO_PERFORMANCE_MODE_LOW_LATENCY;
+            const ma_bool32 isVoiceCapture = (deviceType == ma_device_type_capture)
+                                          && (pConfig->aaudio.inputPreset == ma_aaudio_input_preset_voice_communication);
+            const ma_bool32 isVoicePlayback = (deviceType == ma_device_type_playback)
+                                           && (pConfig->aaudio.usage == ma_aaudio_usage_voice_communication);
+            if (isVoiceCapture || isVoicePlayback) {
+                perfMode = MA_AAUDIO_PERFORMANCE_MODE_NONE;
+            }
+            ((MA_PFN_AAudioStreamBuilder_setPerformanceMode)pContext->aaudio.AAudioStreamBuilder_setPerformanceMode)(pBuilder, perfMode);
+        }
 
         /* We need to set an error callback to detect device changes. */
         if (pDevice != NULL) {  /* <-- pDevice should never be null if pDescriptor is not null, which is always the case if we hit this branch. Check anyway for safety. */
