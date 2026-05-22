@@ -11593,6 +11593,7 @@ IMPLEMENTATION
     #if !defined(MA_NO_THREADING)
         #include <sched.h>
         #include <pthread.h>     /* For pthreads. */
+        #include <semaphore.h>   /* For sem_timedwait() used in AAudio uninit. */
     #endif
 
     #include <sys/time.h>   /* select() (used for ma_sleep()). */
@@ -39678,6 +39679,27 @@ static ma_result ma_close_streams__aaudio(ma_device* pDevice)
     return MA_SUCCESS;
 }
 
+/* sdk-patch: AAudioStream_close() blocks indefinitely on Samsung Android with
+   VOICE_COMMUNICATION capture (miniaudio issues #41, #833, #913); run close
+   on a background pthread and bail after 2 s if it hangs. */
+#if defined(__ANDROID__)
+typedef struct {
+    MA_PFN_AAudioStream_close closeFn;
+    ma_AAudioStream*          pCapture;
+    ma_AAudioStream*          pPlayback;
+    sem_t                     done;
+} ma_uninit_task__aaudio;
+
+static void* ma_uninit_task_proc__aaudio(void* pArg)
+{
+    ma_uninit_task__aaudio* p = (ma_uninit_task__aaudio*)pArg;
+    if (p->pCapture)  p->closeFn(p->pCapture);
+    if (p->pPlayback) p->closeFn(p->pPlayback);
+    sem_post(&p->done);
+    return NULL;
+}
+#endif
+
 static ma_result ma_device_uninit__aaudio(ma_device* pDevice)
 {
     MA_ASSERT(pDevice != NULL);
@@ -39691,7 +39713,42 @@ static ma_result ma_device_uninit__aaudio(ma_device* pDevice)
     /* Wait for any rerouting to finish before attempting to close the streams. */
     ma_mutex_lock(&pDevice->aaudio.rerouteLock);
     {
+#if defined(__ANDROID__)
+        ma_uninit_task__aaudio* pTask = (ma_uninit_task__aaudio*)malloc(sizeof(*pTask));
+        if (pTask != NULL) {
+            pTask->closeFn  = (MA_PFN_AAudioStream_close)pDevice->pContext->aaudio.AAudioStream_close;
+            pTask->pCapture  = (pDevice->type == ma_device_type_capture  || pDevice->type == ma_device_type_duplex)
+                                ? (ma_AAudioStream*)pDevice->aaudio.pStreamCapture  : NULL;
+            pTask->pPlayback = (pDevice->type == ma_device_type_playback || pDevice->type == ma_device_type_duplex)
+                                ? (ma_AAudioStream*)pDevice->aaudio.pStreamPlayback : NULL;
+            pDevice->aaudio.pStreamCapture  = NULL;
+            pDevice->aaudio.pStreamPlayback = NULL;
+            sem_init(&pTask->done, 0, 0);
+
+            pthread_t thread;
+            if (pthread_create(&thread, NULL, ma_uninit_task_proc__aaudio, pTask) == 0) {
+                struct timespec deadline;
+                clock_gettime(CLOCK_REALTIME, &deadline);
+                deadline.tv_sec += 2;
+                if (sem_timedwait(&pTask->done, &deadline) == 0) {
+                    pthread_join(thread, NULL);
+                    sem_destroy(&pTask->done);
+                    free(pTask);
+                } else {
+                    pthread_detach(thread); /* timed out; leak pTask, OS cleans up on exit */
+                }
+            } else {
+                if (pTask->pCapture)  pTask->closeFn(pTask->pCapture);
+                if (pTask->pPlayback) pTask->closeFn(pTask->pPlayback);
+                sem_destroy(&pTask->done);
+                free(pTask);
+            }
+        } else {
+            ma_close_streams__aaudio(pDevice);
+        }
+#else
         ma_close_streams__aaudio(pDevice);
+#endif
     }
     ma_mutex_unlock(&pDevice->aaudio.rerouteLock);
 
