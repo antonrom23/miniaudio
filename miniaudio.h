@@ -29986,13 +29986,22 @@ static ma_result ma_device_data_loop_wakeup__alsa(ma_device* pDevice)
     return MA_SUCCESS;
 }
 
+/* sdk-patch: refcount contexts so libasound's global snd_config is freed
+   only on the last uninit (concurrent free races otherwise). */
+static pthread_mutex_t g_ma_alsa_lifecycle_lock = PTHREAD_MUTEX_INITIALIZER;
+static int             g_ma_alsa_ctx_refcount  = 0;
+
 static ma_result ma_context_uninit__alsa(ma_context* pContext)
 {
     MA_ASSERT(pContext != NULL);
     MA_ASSERT(pContext->backend == ma_backend_alsa);
 
     /* Clean up memory for memory leak checkers. */
-    ((ma_snd_config_update_free_global_proc)pContext->alsa.snd_config_update_free_global)();
+    pthread_mutex_lock(&g_ma_alsa_lifecycle_lock);
+    if (--g_ma_alsa_ctx_refcount == 0) {
+        ((ma_snd_config_update_free_global_proc)pContext->alsa.snd_config_update_free_global)();
+    }
+    pthread_mutex_unlock(&g_ma_alsa_lifecycle_lock);
 
 #ifndef MA_NO_RUNTIME_LINKING
     ma_dlclose(ma_context_get_log(pContext), pContext->alsa.asoundSO);
@@ -30250,6 +30259,10 @@ static ma_result ma_context_init__alsa(ma_context* pContext, const ma_context_co
     pCallbacks->onDeviceWrite             = ma_device_write__alsa;
     pCallbacks->onDeviceDataLoop          = NULL;
     pCallbacks->onDeviceDataLoopWakeup    = ma_device_data_loop_wakeup__alsa;
+
+    pthread_mutex_lock(&g_ma_alsa_lifecycle_lock);
+    ++g_ma_alsa_ctx_refcount;
+    pthread_mutex_unlock(&g_ma_alsa_lifecycle_lock);
 
     return MA_SUCCESS;
 }
